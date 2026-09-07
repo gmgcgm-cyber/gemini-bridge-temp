@@ -405,7 +405,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _authorized(update):
         return
     await update.message.reply_text(
-        "Gemini Pro Bridge v3 active.\nSend text or photo."
+        "Gemini Pro Bridge v3 active.\nSend text, photo, voice or document."
     )
 
 
@@ -527,6 +527,55 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(chunk)
 
 
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _authorized(update):
+        return
+
+    chat_id = update.effective_chat.id
+    caption = update.message.caption or ""
+    # Voice messages come as update.message.voice (oga/opus)
+    voice = update.message.voice or update.message.audio
+    if not voice:
+        return
+
+    logger.info(f"[TG] Voice/audio from {chat_id}: {caption[:80]}...")
+
+    file_obj = await context.bot.get_file(voice.file_id)
+    raw_path = DOWNLOAD_DIR / f"{chat_id}_{int(time.time())}.oga"
+    mp3_path = raw_path.with_suffix(".mp3")
+    await file_obj.download_to_drive(str(raw_path))
+    logger.info(f"[+] Voice saved: {raw_path}")
+
+    # Convert oga -> mp3 via ffmpeg
+    converted = False
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", str(raw_path), str(mp3_path)],
+            check=True,
+            capture_output=True,
+            timeout=30,
+        )
+        converted = True
+        logger.info(f"[+] Converted to mp3: {mp3_path}")
+    except Exception as e:
+        logger.warning(f"[!] ffmpeg failed: {e}, sending raw oga")
+        mp3_path = raw_path
+
+    _save_turn(chat_id, "user", caption or "(voice message)", str(mp3_path))
+
+    try:
+        answer = await _send_to_gemini(caption or "Transcribe and summarize.", file_paths=[mp3_path])
+    except Exception as e:
+        logger.exception("Gemini voice send error")
+        await update.message.reply_text(f"❌ Error: {e}")
+        return
+
+    _save_turn(chat_id, "assistant", answer)
+
+    for chunk in [answer[i:i+3900] for i in range(0, len(answer), 3900)]:
+        await update.message.reply_text(chunk)
+
+
 # ─── Main ────────────────────────────────────────────────────────────────────
 
 async def post_init(app):
@@ -553,6 +602,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
 
     logger.info("[*] Starting polling...")
     app.run_polling()
